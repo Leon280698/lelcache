@@ -5,14 +5,20 @@
 #include <assert.h>
 #include <wchar.h>
 
+/*
+ * TODO:
+ * - find out why file locked when compiling in parallel
+ * - consider using /PDBALTPATH:pdb_file_name
+ */
+
 #pragma warning(push, 0)
 #define XXH_INLINE_ALL
 #include "./xxhash/xxhash.h"
 #pragma warning(pop)
 
-#define LEL_HASH_STRING_SIZE (sizeof(XXH64_hash_t) * 2 + 1)
+#define LEL_HASH64_STRING_LENGTH (sizeof(XXH64_hash_t) * 2 + 1) // Two characters per byte
 
-typedef WCHAR Hash64String[LEL_HASH_STRING_SIZE];
+typedef WCHAR Hash64String[LEL_HASH64_STRING_LENGTH + 1];
 
 void hash64_to_string(XXH64_hash_t hash, Hash64String out) {
 	LPCWSTR hexLookup = L"0123456789abcdef";
@@ -24,7 +30,7 @@ void hash64_to_string(XXH64_hash_t hash, Hash64String out) {
 		out[strIndex + 1] = hexLookup[(bytes[i] >> 4) & 0xF];
 	}
 
-	out[LEL_HASH_STRING_SIZE - 1] = L'\0';
+	out[LEL_HASH64_STRING_LENGTH] = L'\0';
 }
 
 void path_from_hash64_string(Hash64String str, LPWSTR buffer) {
@@ -295,15 +301,10 @@ void make_cmd_line(int argc, LPCWSTR* argv, LPWSTR buffer) {
 	int offset = 0;
 
 	for(int i = 0; i < argc; ++i) {
-		int len = lstrlenW(argv[i]);
-
-		lstrcpyW(buffer + offset, L"\"");
-		++offset;
+		buffer[offset++] = L'\"';
 		lstrcpyW(buffer + offset, argv[i]);
-
-		offset += len;
-		lstrcpyW(buffer + offset, L"\"");
-		++offset;
+		offset += lstrlenW(argv[i]);;
+		buffer[offset++] = L'\"';
 		buffer[offset++] = L' ';
 	}
 
@@ -360,6 +361,13 @@ XXH64_hash_t hash_file_content(LPWSTR filePath) {
 	}
 
 	return hash;
+}
+
+UINT64 file_size(LPCWSTR filePath) {
+	WIN32_FILE_ATTRIBUTE_DATA fileAttribData;
+
+	return GetFileAttributesExW(filePath, GetFileExInfoStandard, &fileAttribData) ?
+		(UINT64)fileAttribData.nFileSizeHigh << 32 | fileAttribData.nFileSizeLow : 0;
 }
 
 BOOL file_exists(LPCWSTR path) {
@@ -500,7 +508,7 @@ int lelcache_main(int argc, LPWSTR* argv) {
 
 			LPWSTR hashPathEnd = hashPath + lstrlenW(hashPath);
 
-			lstrcatW(hashPath, L"\\obj");
+			lstrcpyW(hashPathEnd, L"\\obj");
 
 			if(file_exists(hashPath)) {
 				++cacheInfo.numCacheHits;
@@ -510,9 +518,7 @@ int lelcache_main(int argc, LPWSTR* argv) {
 				CopyFileW(hashPath, cmdLineInfo.objectFile, FALSE);
 
 				if(cmdLineInfo.pdbFile) {
-					*hashPathEnd = L'\0';
-
-					lstrcatW(hashPath, L"\\pdb");
+					lstrcatW(hashPathEnd, L"\\pdb");
 
 					if(file_exists(hashPath)) {
 						CopyFileW(hashPath, cmdLineInfo.pdbFile, FALSE);
@@ -524,7 +530,7 @@ int lelcache_main(int argc, LPWSTR* argv) {
 				ReleaseMutex(cacheInfoMutex);
 				make_cmd_line((int)cmdLineInfo.numCompilerFlags, cmdLineInfo.compilerFlags, cmdLineBuffer);
 
-				*hashPathEnd = L'\0';
+				*hashPathEnd = L'\0'; // Stripping '\obj' since it is a file and not part of the path
 
 				if(make_path(hashPath) && launch_process(argv[1], cmdLineBuffer, &processInfo)) {
 					exitCode = wait_for_process(&processInfo);
@@ -532,35 +538,18 @@ int lelcache_main(int argc, LPWSTR* argv) {
 					if(exitCode == 0) {
 						UINT64 additionalHashSize = 0;
 
-						lstrcatW(hashPath, L"\\obj");
+						lstrcpyW(hashPathEnd, L"\\obj");
 						CopyFileW(cmdLineInfo.temporaryCompiledObjectFile, hashPath, FALSE);
 						MoveFileW(cmdLineInfo.temporaryCompiledObjectFile, cmdLineInfo.objectFile);
 
-						LARGE_INTEGER fileSize;
-						HANDLE file = CreateFileW(hashPath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-
-						if(file != INVALID_HANDLE_VALUE) {
-							if(GetFileSizeEx(file, &fileSize))
-								additionalHashSize += fileSize.QuadPart;
-
-							CloseHandle(file);
-						}
+						additionalHashSize += file_size(hashPath);
 
 						if(cmdLineInfo.pdbFile) {
-							*hashPathEnd = L'\0';
-
-							lstrcatW(hashPath, L"\\pdb");
+							lstrcpyW(hashPathEnd, L"\\pdb");
 							CopyFileW(cmdLineInfo.temporaryDebugInformationDatabase, hashPath, FALSE);
 							MoveFileW(cmdLineInfo.temporaryDebugInformationDatabase, cmdLineInfo.pdbFile);
 
-							file = CreateFileW(hashPath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-
-							if(file != INVALID_HANDLE_VALUE) {
-								if(GetFileSizeEx(file, &fileSize))
-									additionalHashSize += fileSize.QuadPart;
-
-								CloseHandle(file);
-							}
+							additionalHashSize += file_size(hashPath);
 						}
 
 						WaitForSingleObject(cacheInfoMutex, INFINITE);
@@ -586,12 +575,18 @@ int lelcache_main(int argc, LPWSTR* argv) {
 
 		_freea(cmdLineBuffer);
 	} else {
-		LPWSTR cmdLine = GetCommandLineW() + lstrlenW(argv[0]);
+		int cmdLineLen = (argc - 1) * 3; // Enough for surrounding quotes and separating space
 
-		while(iswspace(*cmdLine))
-			++cmdLine;
+		for(int i = 1; i < argc; ++i)
+			cmdLineLen += lstrlenW(argv[i]);
+
+		LPWSTR cmdLine = _malloca(cmdLineLen * sizeof(WCHAR));
+
+		make_cmd_line(argc - 1, argv + 1, cmdLine);
 
 		exitCode = launch_process(argv[1], cmdLine, &processInfo) ? wait_for_process(&processInfo) : EXIT_FAILURE;
+
+		_freea(cmdLine);
 	}
 
 	return exitCode;
@@ -637,15 +632,17 @@ int wmain(int argc, LPWSTR* argv, LPWSTR* envp) {
 			case 'i':
 				if(cache_info(&info, FALSE)) {
 					wprintf(L"cache hits:         %lu\n"
-						L"cache misses:       %lu\n"
-						L"maximum cache size: %llu MB\n"
-						L"current cache size: %llu MB\n"
-						L"cache location:     %s\n",
-						info.numCacheHits,
-						info.numCacheMisses,
-						info.maxCacheSize / (1024ll * 1024ll),
-						info.currentCacheSize / (1024ll * 1024ll),
-						info.cachePath);
+							L"cache misses:       %lu\n"
+							L"cache hit rate:     %.2f%%\n"
+							L"maximum cache size: %llu MB\n"
+							L"current cache size: %llu MB\n"
+							L"cache location:     %s\n",
+							info.numCacheHits,
+							info.numCacheMisses,
+							(float)info.numCacheHits / (info.numCacheHits + info.numCacheMisses) * 100.0f,
+							info.maxCacheSize / (1024ll * 1024ll),
+							info.currentCacheSize / (1024ll * 1024ll),
+							info.cachePath);
 				}
 
 				break;
