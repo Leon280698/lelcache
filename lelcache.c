@@ -16,7 +16,7 @@
 #include "./xxhash/xxhash.h"
 #pragma warning(pop)
 
-#define LEL_HASH64_STRING_LENGTH (sizeof(XXH64_hash_t) * 2 + 1) // Two characters per byte
+#define LEL_HASH64_STRING_LENGTH (sizeof(XXH64_hash_t) * 2) // Two characters per byte
 
 typedef WCHAR Hash64String[LEL_HASH64_STRING_LENGTH + 1];
 
@@ -34,7 +34,7 @@ void hash64_to_string(XXH64_hash_t hash, Hash64String out) {
 }
 
 void path_from_hash64_string(Hash64String str, LPWSTR buffer) {
-	for(int i = 0; i < sizeof(XXH64_hash_t); i += 2) {
+	for(int i = 0; i < sizeof(XXH64_hash_t) / 2; i += 2) { // TODO: Don't use full hash for the path
 		*buffer = str[i];
 		++buffer;
 		*buffer = str[i + 1];
@@ -46,8 +46,8 @@ void path_from_hash64_string(Hash64String str, LPWSTR buffer) {
 	*buffer = L'\0';
 }
 
-LPCWSTR file_name_from_path(LPCWSTR filePath) {
-	LPCWSTR tmp = filePath;
+LPWSTR file_name_from_path(LPWSTR filePath) {
+	LPWSTR tmp = filePath;
 
 	while(*tmp)
 		++tmp;
@@ -84,8 +84,8 @@ int __cdecl compare_strings_for_qsort(const void* a, const void* b) {
 }
 
 // Should be more than enough for pretty much any case...
-#define MAX_PREPROCESSOR_FLAGS 64
-#define MAX_COMPILER_FLAGS 64
+#define MAX_PREPROCESSOR_FLAGS 128
+#define MAX_COMPILER_FLAGS 128
 
 struct CommandLineInfo {
 	LPWSTR sourceFile;
@@ -125,6 +125,28 @@ BOOL is_preprocessor_flag(LPCWSTR flag) {
 		   *flag == L'X';
 }
 
+void add_preprocessor_flag(struct CommandLineInfo* cmdLineInfo, LPWSTR flag) {
+	if(cmdLineInfo->numPreprocessorFlags >= MAX_PREPROCESSOR_FLAGS) {
+		wprintf(L"ERROR: More than %i preprocessor flags. WTF are you doing?\n", MAX_PREPROCESSOR_FLAGS);
+		ExitProcess(EXIT_FAILURE);
+	}
+
+	cmdLineInfo->preprocessorFlags[cmdLineInfo->numPreprocessorFlags] = flag;
+	cmdLineInfo->preprocessorCmdLineLength += lstrlenW(cmdLineInfo->preprocessorFlags[cmdLineInfo->numPreprocessorFlags]);
+	++cmdLineInfo->numPreprocessorFlags;
+}
+
+void add_compiler_flag(struct CommandLineInfo* cmdLineInfo, LPWSTR flag) {
+	if(cmdLineInfo->numCompilerFlags >= MAX_COMPILER_FLAGS) {
+		wprintf(L"ERROR: More than %i compiler flags. WTF are you doing?\n", MAX_COMPILER_FLAGS);
+		ExitProcess(EXIT_FAILURE);
+	}
+
+	cmdLineInfo->compilerFlags[cmdLineInfo->numCompilerFlags] = flag;
+	cmdLineInfo->compilerCmdLineLength += lstrlenW(cmdLineInfo->compilerFlags[cmdLineInfo->numCompilerFlags]);
+	++cmdLineInfo->numCompilerFlags;
+}
+
 /*
  * Parses the compiler command line and extracts necessary information like input/output files etc.
  * Returns FALSE if command line is not understood and thus should be directly forwarded to the compiler instead
@@ -141,23 +163,13 @@ BOOL parse_cl_command_line(int argc, LPWSTR* argv, struct CommandLineInfo* cmdLi
 
 	// Preprocessor command line initial setup
 
-	cmdLineInfo->preprocessorFlags[cmdLineInfo->numPreprocessorFlags] = argv[1]; // cl.exe
-	cmdLineInfo->preprocessorCmdLineLength += lstrlenW(cmdLineInfo->preprocessorFlags[cmdLineInfo->numPreprocessorFlags]);
-	++cmdLineInfo->numPreprocessorFlags;
-
-	cmdLineInfo->preprocessorFlags[cmdLineInfo->numPreprocessorFlags] = L"/P";
-	cmdLineInfo->preprocessorCmdLineLength += lstrlenW(cmdLineInfo->preprocessorFlags[cmdLineInfo->numPreprocessorFlags]);
-	++cmdLineInfo->numPreprocessorFlags;
-
-	cmdLineInfo->preprocessorFlags[cmdLineInfo->numPreprocessorFlags] = L"/nologo";
-	cmdLineInfo->preprocessorCmdLineLength += lstrlenW(cmdLineInfo->preprocessorFlags[cmdLineInfo->numPreprocessorFlags]);
-	++cmdLineInfo->numPreprocessorFlags;
+	add_preprocessor_flag(cmdLineInfo, argv[1]); // cl.exe
+	add_preprocessor_flag(cmdLineInfo, L"/P");
+	add_preprocessor_flag(cmdLineInfo, L"/nologo");
 
 	// Compiler command line initial setup
 
-	cmdLineInfo->compilerFlags[cmdLineInfo->numCompilerFlags] = argv[1]; // cl.exe
-	cmdLineInfo->compilerCmdLineLength += lstrlenW(cmdLineInfo->compilerFlags[cmdLineInfo->numCompilerFlags]);
-	++cmdLineInfo->numCompilerFlags;
+	add_compiler_flag(cmdLineInfo, argv[1]); // cl.exe
 
 	// Parsing command line
 
@@ -172,11 +184,8 @@ BOOL parse_cl_command_line(int argc, LPWSTR* argv, struct CommandLineInfo* cmdLi
 				if(*flag == L'E' || *flag == L'P') // Only preprocess, don't compile
 					return FALSE;
 
-				cmdLineInfo->preprocessorFlags[cmdLineInfo->numPreprocessorFlags++] = argv[i];
-				cmdLineInfo->preprocessorCmdLineLength += lstrlenW(argv[i]);
-
-				cmdLineInfo->compilerFlags[cmdLineInfo->numCompilerFlags++] = argv[i];
-				cmdLineInfo->compilerCmdLineLength += lstrlenW(argv[i]);
+				add_preprocessor_flag(cmdLineInfo, argv[i]);
+				add_compiler_flag(cmdLineInfo, argv[i]);
 
 				continue;
 			}
@@ -218,8 +227,7 @@ BOOL parse_cl_command_line(int argc, LPWSTR* argv, struct CommandLineInfo* cmdLi
 			if(flag[0] == L'Z' && (flag[1] == L'i' || flag[1] == 'I'))
 				generatesPdb = TRUE;
 
-			cmdLineInfo->compilerFlags[cmdLineInfo->numCompilerFlags++] = argv[i];
-			cmdLineInfo->compilerCmdLineLength += lstrlenW(argv[i]);
+			add_compiler_flag(cmdLineInfo, argv[i]);
 		} else {
 			if(cmdLineInfo->sourceFile)
 				return FALSE; // Multiple source files are not supported at the moment
@@ -231,23 +239,25 @@ BOOL parse_cl_command_line(int argc, LPWSTR* argv, struct CommandLineInfo* cmdLi
 	if(compilesToObj && cmdLineInfo->sourceFile) {
 		// Preprocessor options
 
+
+
 		XXH64_hash_t hash = XXH64(cmdLineInfo->sourceFile, lstrlenW(cmdLineInfo->sourceFile), 0);
 		Hash64String tempFileName;
+		LPWSTR sourceFileName = file_name_from_path(cmdLineInfo->sourceFile);
 		LPCWSTR srcFileExt = file_extension_from_path(cmdLineInfo->sourceFile);
 
 		hash64_to_string(hash, tempFileName);
+
 		lstrcpyW(cmdLineInfo->preprocessorOutputFile, L"/Fi:");
+		lstrcatW(cmdLineInfo->preprocessorOutputFile, sourceFileName);
 		lstrcatW(cmdLineInfo->preprocessorOutputFile, tempFileName);
-		lstrcatW(cmdLineInfo->preprocessorOutputFile, L".");
+		lstrcatW(cmdLineInfo->preprocessorOutputFile, L".preprocessed.");
 		lstrcatW(cmdLineInfo->preprocessorOutputFile, srcFileExt);
 
 		cmdLineInfo->temporaryPreprocessedFile = cmdLineInfo->preprocessorOutputFile + ARRAYSIZE(L"/Fi:") - 1;
 
-		cmdLineInfo->preprocessorFlags[cmdLineInfo->numPreprocessorFlags++] = cmdLineInfo->preprocessorOutputFile;
-		cmdLineInfo->preprocessorCmdLineLength += lstrlenW(cmdLineInfo->preprocessorOutputFile);
-
-		cmdLineInfo->preprocessorFlags[cmdLineInfo->numPreprocessorFlags++] = cmdLineInfo->sourceFile;
-		cmdLineInfo->preprocessorCmdLineLength += lstrlenW(cmdLineInfo->sourceFile);
+		add_preprocessor_flag(cmdLineInfo, cmdLineInfo->preprocessorOutputFile);
+		add_preprocessor_flag(cmdLineInfo, cmdLineInfo->sourceFile);
 
 		// Compiler options
 
@@ -263,33 +273,31 @@ BOOL parse_cl_command_line(int argc, LPWSTR* argv, struct CommandLineInfo* cmdLi
 		}
 
 		lstrcpyW(cmdLineInfo->compilerOutputFile, L"/Fo:");
+		lstrcatW(cmdLineInfo->compilerOutputFile, sourceFileName);
 		lstrcatW(cmdLineInfo->compilerOutputFile, tempFileName);
-		lstrcatW(cmdLineInfo->compilerOutputFile, L".obj");
+		lstrcatW(cmdLineInfo->compilerOutputFile, L".compiled.obj");
 
 		cmdLineInfo->temporaryCompiledObjectFile = cmdLineInfo->compilerOutputFile + ARRAYSIZE(L"/Fo:") - 1;
 
-		cmdLineInfo->compilerFlags[cmdLineInfo->numCompilerFlags++] = cmdLineInfo->compilerOutputFile;
-		cmdLineInfo->compilerCmdLineLength += lstrlenW(cmdLineInfo->compilerOutputFile);
+		add_compiler_flag(cmdLineInfo, cmdLineInfo->compilerOutputFile);
 
 		if(generatesPdb) {
 			if(!cmdLineInfo->pdbFile)
 				cmdLineInfo->pdbFile = L"vc140.pdb"; // Strange visual studio default behavior...
 
 			lstrcpyW(cmdLineInfo->debugInformationOutputFile, L"/Fd:");
+			lstrcatW(cmdLineInfo->debugInformationOutputFile, sourceFileName);
 			lstrcatW(cmdLineInfo->debugInformationOutputFile, tempFileName);
-			lstrcatW(cmdLineInfo->debugInformationOutputFile, L".pdb");
+			lstrcatW(cmdLineInfo->debugInformationOutputFile, L".debugsymbols.pdb");
 
 			cmdLineInfo->temporaryDebugInformationDatabase = cmdLineInfo->debugInformationOutputFile + ARRAYSIZE(L"/Fd:") - 1;
 
-			cmdLineInfo->compilerFlags[cmdLineInfo->numCompilerFlags++] = cmdLineInfo->debugInformationOutputFile;
-			cmdLineInfo->compilerCmdLineLength += lstrlenW(cmdLineInfo->debugInformationOutputFile);
+			add_compiler_flag(cmdLineInfo, cmdLineInfo->debugInformationOutputFile);
 		} else {
 			cmdLineInfo->pdbFile = NULL; // Resetting this in case /Fd was used without /Zi
 		}
 
-		// Adding the preprocessed output file to the compiler command line
-		cmdLineInfo->compilerFlags[cmdLineInfo->numCompilerFlags++] = cmdLineInfo->temporaryPreprocessedFile;
-		cmdLineInfo->compilerCmdLineLength += lstrlenW(cmdLineInfo->temporaryPreprocessedFile);
+		add_compiler_flag(cmdLineInfo, cmdLineInfo->sourceFile);
 
 		return TRUE;
 	}
@@ -310,7 +318,6 @@ void make_cmd_line(int argc, LPCWSTR* argv, LPWSTR buffer) {
 
 	buffer[offset - 1] = '\0';
 }
-
 
 BOOL launch_process(LPCWSTR executable, LPWSTR cmdLine, LPPROCESS_INFORMATION outProcessInfo) {
 	STARTUPINFOW startupInfo = {.cb = sizeof(startupInfo)};
@@ -388,7 +395,7 @@ BOOL make_path(LPCWSTR path) {
 
 		if((attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0)) { // Create directory only if it doesn't exist
 			if(!CreateDirectoryW(tempPath, NULL)) {
-				wprintf(L"Unable to create directory '%s'\n", path);
+				wprintf(L"Unable to create directory '%s'\n", tempPath);
 
 				return FALSE;
 			}
@@ -400,7 +407,7 @@ BOOL make_path(LPCWSTR path) {
 
 struct CacheInfo {
 	UINT32 numCacheHits;
-	UINT32 numCacheMisses;
+	UINT32 numCacheMisses; // Does not include cases when the command line was not understood and the compiler was called directly. TODO: should it?
 	UINT64 maxCacheSize;
 	UINT64 currentCacheSize;
 	WCHAR cachePath[MAX_PATH];
@@ -561,7 +568,7 @@ int lelcache_main(int argc, LPWSTR* argv) {
 						DeleteFileW(cmdLineInfo.temporaryCompiledObjectFile);
 
 						if(cmdLineInfo.pdbFile)
-							DeleteFileW(cmdLineInfo.temporaryCompiledObjectFile);
+							DeleteFileW(cmdLineInfo.temporaryDebugInformationDatabase);
 					}
 				}
 			}
