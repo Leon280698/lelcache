@@ -12,8 +12,8 @@
 
 /*
  * TODO:
- * - Handle edge case when source file has not changed but the name of the associated pdb is different.
- *    -> Copy object file from cache and manually change the pdb name inside (COFF).
+ *     - Perform cleanup if current cache size >= max cache size
+ *     - Make use of GetLastError where it makes sense
  */
 
 #define DEFAULT_CACHE_SIZE_GIGABYTES 4
@@ -28,6 +28,7 @@ void hash64_to_string(XXH64_hash_t hash, Hash64String out) {
 
 	for(int i = 0; i < sizeof(XXH64_hash_t); ++i) {
 		int strIndex = i * 2;
+
 		out[strIndex] = hexLookup[bytes[i] & 0x0F];
 		out[strIndex + 1] = hexLookup[(bytes[i] >> 4) & 0xF];
 	}
@@ -36,7 +37,7 @@ void hash64_to_string(XXH64_hash_t hash, Hash64String out) {
 }
 
 void path_from_hash64_string(Hash64String str, LPWSTR buffer) {
-	for(int i = 0; i < sizeof(XXH64_hash_t); i += 2) {
+	for(int i = 0; i < LEL_HASH64_STRING_LENGTH / 2; i += 2) {
 		*buffer = str[i];
 		++buffer;
 		*buffer = str[i + 1];
@@ -60,13 +61,13 @@ LPWSTR file_name_from_path(LPWSTR filePath) {
 	return tmp;
 }
 
-LPCWSTR file_extension_from_path(LPCWSTR filePath) {
-	LPCWSTR tmp = filePath;
+LPWSTR file_extension_from_path(LPWSTR filePath) {
+	LPWSTR tmp = filePath;
 
 	while(*tmp)
 		++tmp;
 
-	LPCWSTR end = tmp;
+	LPWSTR end = tmp;
 
 	while(tmp != filePath && *(tmp - 1) != L'.') {
 		--tmp;
@@ -78,7 +79,7 @@ LPCWSTR file_extension_from_path(LPCWSTR filePath) {
 		}
 	}
 
-	return tmp;
+	return tmp != filePath ? tmp : end;
 }
 
 int __cdecl compare_strings_for_qsort(const void* a, const void* b) {
@@ -112,10 +113,10 @@ struct CommandLineInfo {
 	LPWSTR temporaryPreprocessedFile;
 	LPWSTR temporaryCompiledObjectFile;
 	LPWSTR temporaryDebugInformationDatabase;
-	int numPreprocessorFlags;
-	int preprocessorCmdLineLength;
-	int numCompilerFlags;
-	int compilerCmdLineLength;
+	SIZE_T numPreprocessorFlags;
+	SIZE_T preprocessorCmdLineLength;
+	SIZE_T numCompilerFlags;
+	SIZE_T compilerCmdLineLength;
 	LPWSTR preprocessorFlags[MAX_PREPROCESSOR_FLAGS];
 	LPWSTR compilerFlags[MAX_COMPILER_FLAGS];
 	WCHAR preprocessorOutputFile[MAX_PATH];
@@ -187,7 +188,7 @@ BOOL parse_cl_command_line(int argc, LPWSTR* argv, struct CommandLineInfo* cmdLi
 	add_preprocessor_flag(cmdLineInfo, L"/P");
 	add_preprocessor_flag(cmdLineInfo, L"/nologo");
 
-	int endAdditionalPreprocessorArgs = cmdLineInfo->numPreprocessorFlags;
+	int endAdditionalPreprocessorArgs = (int)cmdLineInfo->numPreprocessorFlags;
 
 	// Compiler command line initial setup
 
@@ -211,18 +212,15 @@ BOOL parse_cl_command_line(int argc, LPWSTR* argv, struct CommandLineInfo* cmdLi
 				continue;
 			}
 
-			// Checking for output file names
-
 			if(*flag == L'F') {
 				LPCWSTR* outputFileStr = NULL;
 
 				switch(flag[1]) {
-				case L'd':
-					outputFileStr = &cmdLineInfo->pdbFile;
-					break;
 				case L'o':
 					outputFileStr = &cmdLineInfo->objectFile;
 					break;
+				case L'S': // The /FS flag is ignored as pdb files are generated individually for each object file
+					continue;
 				}
 
 				if(outputFileStr) {
@@ -270,7 +268,6 @@ BOOL parse_cl_command_line(int argc, LPWSTR* argv, struct CommandLineInfo* cmdLi
 
 		WCHAR tempFileName[MAX_PATH];
 		LPWSTR sourceFileName = file_name_from_path(cmdLineInfo->sourceFile);
-		//LPCWSTR srcFileExt = file_extension_from_path(cmdLineInfo->sourceFile);
 
 		GetTempFileNameW(L".", sourceFileName, 0, tempFileName);
 
@@ -287,7 +284,7 @@ BOOL parse_cl_command_line(int argc, LPWSTR* argv, struct CommandLineInfo* cmdLi
 		if(!cmdLineInfo->objectFile) { // If object file was not specified it is assumed to be the base name of the source file with the extension '.obj'
 			lstrcpyW(cmdLineInfo->objectFileBuffer, file_name_from_path(cmdLineInfo->sourceFile));
 
-			LPWSTR ext = (LPWSTR)file_extension_from_path(cmdLineInfo->objectFileBuffer);
+			LPWSTR ext = file_extension_from_path(cmdLineInfo->objectFileBuffer);
 
 			*ext = L'\0';
 			lstrcatW(ext, L"obj");
@@ -319,14 +316,12 @@ BOOL parse_cl_command_line(int argc, LPWSTR* argv, struct CommandLineInfo* cmdLi
 		add_compiler_flag(cmdLineInfo, cmdLineInfo->compilerOutputFile);
 
 		if(generatesPdb) {
-			if(!cmdLineInfo->pdbFile)
-				cmdLineInfo->pdbFile = L"vc140.pdb"; // Strange visual studio default behavior...
-
 			lstrcpyW(cmdLineInfo->debugInformationOutputFile, L"/Fd:");
-			lstrcatW(cmdLineInfo->debugInformationOutputFile, cmdLineInfo->pdbFile);
+			lstrcatW(cmdLineInfo->debugInformationOutputFile, cmdLineInfo->objectFile);
+			lstrcatW(cmdLineInfo->debugInformationOutputFile, L".pdb");
 			add_compiler_flag(cmdLineInfo, cmdLineInfo->debugInformationOutputFile);
-		} else {
-			cmdLineInfo->pdbFile = NULL; // Resetting this in case /Fd was used without /Zi
+
+			cmdLineInfo->pdbFile = cmdLineInfo->debugInformationOutputFile + ARRAYSIZE(L"/Fd:") - 1;
 		}
 
 		add_compiler_flag(cmdLineInfo, cmdLineInfo->sourceFile);
@@ -368,6 +363,7 @@ DWORD wait_for_process(LPPROCESS_INFORMATION processInfo) {
 
 XXH64_hash_t hash_file_content(LPWSTR filePath) {
 	XXH64_hash_t hash = 0;
+	// TODO: Maybe use a memory mapped file instead?
 	HANDLE file = CreateFileW(filePath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 
 	if(file != INVALID_HANDLE_VALUE) {
@@ -399,6 +395,7 @@ XXH64_hash_t hash_file_content(LPWSTR filePath) {
 UINT64 file_size(LPCWSTR filePath) {
 	WIN32_FILE_ATTRIBUTE_DATA fileAttribData;
 
+	// This is much faster than GetFileSize
 	return GetFileAttributesExW(filePath, GetFileExInfoStandard, &fileAttribData) ?
 		(UINT64)fileAttribData.nFileSizeHigh << 32 | fileAttribData.nFileSizeLow : 0;
 }
@@ -408,7 +405,7 @@ BOOL file_exists(LPCWSTR path) {
 }
 
 BOOL make_path(LPCWSTR path) {
-	WCHAR tempPath[MAX_PATH] = {0};
+	WCHAR tempPath[MAX_PATH];
 	int index = 0;
 
 	while(*path) {
@@ -416,6 +413,8 @@ BOOL make_path(LPCWSTR path) {
 			tempPath[index++] = *path;
 			++path;
 		} while(*path && *path != L'\\');
+
+		tempPath[index] = L'\0';
 
 		DWORD attributes = GetFileAttributesW(tempPath);
 
@@ -483,6 +482,7 @@ BOOL cache_config(struct CacheConfig* config, BOOL write) {
 			config->maxCacheSize = DEFAULT_CACHE_SIZE_GIGABYTES * 1024ll * 1024ll * 1024ll;
 			SHGetKnownFolderPath(&FOLDERID_Profile, 0, NULL, &cachePath); // Default cache path is in the user directory
 			lstrcpyW(config->cachePath, cachePath);
+			lstrcatW(config->cachePath, L"\\.lelcache");
 			CoTaskMemFree(cachePath);
 		}
 	}
@@ -500,7 +500,6 @@ BOOL cache_info(struct CacheInfo* info, BOOL write) {
 	WCHAR cacheInfoPath[MAX_PATH];
 
 	lstrcpyW(cacheInfoPath, globalConfig.cachePath);
-	lstrcatW(cacheInfoPath, L"\\.lelcache");
 	make_path(cacheInfoPath);
 	lstrcatW(cacheInfoPath, L"\\cache.info");
 
@@ -519,7 +518,7 @@ BOOL cache_info(struct CacheInfo* info, BOOL write) {
 		CloseHandle(file);
 	} else {
 		if(file_exists(cacheInfoPath)) { // If file exists read it, otherwise initialize info with default values
-			HANDLE file = CreateFileW(cacheInfoPath, GENERIC_READ, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+			HANDLE file = CreateFileW(cacheInfoPath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 
 			if(file == INVALID_HANDLE_VALUE) {
 				wprintf(L"Unable to open cache info file at '%s' for reading\n", cacheInfoPath);
@@ -560,15 +559,14 @@ int lelcache_main(int argc, LPWSTR* argv) {
 		make_cmd_line((int)cmdLineInfo.numPreprocessorFlags, cmdLineInfo.preprocessorFlags, cmdLineBuffer);
 
 		if(launch_process(argv[1], cmdLineBuffer, &processInfo, TRUE) && wait_for_process(&processInfo) == 0) {
-			HANDLE cacheInfoMutex = CreateMutexW(NULL, FALSE, L"lelcacheinfofile");
-			assert(cacheInfoMutex); // Does this ever fail?
+			HANDLE cacheInfoMutex = CreateMutexW(NULL, FALSE, L"lelcacheinfofile"); // The cache.info file is possibly being accessed by multiple processes at once which must be synchronized
 			struct CacheInfo cacheInfo;
 			WCHAR hashPath[MAX_PATH];
 			XXH64_hash_t hash = hash_file_content(cmdLineInfo.temporaryPreprocessedFile);
 			Hash64String hashStr;
 
 			lstrcpyW(hashPath, globalConfig.cachePath);
-			lstrcatW(hashPath, L"\\.lelcache\\");
+			lstrcatW(hashPath, L"\\");
 			hash64_to_string(hash, hashStr);
 			path_from_hash64_string(hashStr, hashPath + lstrlenW(hashPath));
 			hash64_to_string(cmdLineInfo.compilerCmdLineHash, hashStr);
@@ -662,7 +660,7 @@ void print_help() {
 			L" -h      show this help\n"
 			L" -i      show info\n"
 			L" -m<n>   set maximum cache size to n megabytes\n"
-			L" -p<d>   set cache path to directory d\n");
+			L" -p<dir> set cache path to <dir>\\.lelcache\n");
 }
 
 int wmain(int argc, LPWSTR* argv, LPWSTR* envp) {
@@ -674,7 +672,7 @@ int wmain(int argc, LPWSTR* argv, LPWSTR* envp) {
 		return EXIT_FAILURE;
 	}
 
-	if (!cache_config(&globalConfig, FALSE))
+	if(!cache_config(&globalConfig, FALSE))
 		return EXIT_FAILURE;
 
 	if(*argv[1] == L'-') {
@@ -692,7 +690,7 @@ int wmain(int argc, LPWSTR* argv, LPWSTR* envp) {
 			case L'h':
 				print_help();
 				break;
-			case 'i':
+			case L'i':
 				if(cache_info(&info, FALSE)) {
 					wprintf(L"cache hits:         %lu\n"
 							L"cache misses:       %lu\n"
@@ -702,14 +700,14 @@ int wmain(int argc, LPWSTR* argv, LPWSTR* envp) {
 							L"cache location:     %s\n",
 							info.numCacheHits,
 							info.numCacheMisses,
-							(float)info.numCacheHits / (info.numCacheHits + info.numCacheMisses) * 100.0f,
+							info.numCacheHits / ((double)info.numCacheHits + info.numCacheMisses) * 100.0,
 							info.currentCacheSize / (1024ll * 1024ll),
 							globalConfig.maxCacheSize / (1024ll * 1024ll),
 							globalConfig.cachePath);
 				}
 
 				break;
-			case 'm':
+			case L'm':
 				{
 					++arg;
 
@@ -722,12 +720,13 @@ int wmain(int argc, LPWSTR* argv, LPWSTR* envp) {
 							return EXIT_FAILURE;
 						}
 					}
-				
+
 					UINT64 newCacheSize = (UINT64)wcstoull(arg, NULL, 0);
 
-					if(newCacheSize >= 32) {
+					if(newCacheSize >= 32) { // Arbitrary number but such small values don't make sense anyway...
 						globalConfig.maxCacheSize = newCacheSize * 1024ll * 1024ll; // TODO: Clean up the cache if necessary
 						cache_config(&globalConfig, TRUE);
+						wprintf(L"Maximum cache size set to %lli MB\n", newCacheSize);
 					} else {
 						wprintf(L"Cache size must be at least 32 megabytes\n");
 
@@ -736,7 +735,7 @@ int wmain(int argc, LPWSTR* argv, LPWSTR* envp) {
 				}
 
 				break;
-			case 'p':
+			case L'p':
 				{
 					++arg;
 
@@ -764,8 +763,10 @@ int wmain(int argc, LPWSTR* argv, LPWSTR* envp) {
 						*arg = L'\0';
 					}
 
+					lstrcatW(buffer, L"\\.lelcache");
 					lstrcpyW(globalConfig.cachePath, buffer);
 					cache_config(&globalConfig, TRUE);
+					wprintf(L"Cache path set to '%s'\n", globalConfig.cachePath);
 				}
 
 				break;
