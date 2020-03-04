@@ -5,16 +5,16 @@
 #include <assert.h>
 #include <wchar.h>
 
-/*
- * TODO:
- * - find out why file locked when compiling in parallel
- * - consider using /PDBALTPATH:pdb_file_name
- */
-
 #pragma warning(push, 0)
 #define XXH_INLINE_ALL
 #include "./xxhash/xxhash.h"
 #pragma warning(pop)
+
+/*
+ * TODO:
+ * - Handle edge case when source file has not changed but the name of the associated pdb is different.
+ *    -> Copy object file from cache and manually change the pdb name inside (COFF).
+ */
 
 #define DEFAULT_CACHE_SIZE_GIGABYTES 4
 
@@ -183,8 +183,11 @@ BOOL parse_cl_command_line(int argc, LPWSTR* argv, struct CommandLineInfo* cmdLi
 	// Preprocessor command line initial setup
 
 	add_preprocessor_flag(cmdLineInfo, argv[1]); // cl.exe
+	add_preprocessor_flag(cmdLineInfo, L"/EP");
 	add_preprocessor_flag(cmdLineInfo, L"/P");
 	add_preprocessor_flag(cmdLineInfo, L"/nologo");
+
+	int endAdditionalPreprocessorArgs = cmdLineInfo->numPreprocessorFlags;
 
 	// Compiler command line initial setup
 
@@ -293,10 +296,7 @@ BOOL parse_cl_command_line(int argc, LPWSTR* argv, struct CommandLineInfo* cmdLi
 		}
 
 		lstrcpyW(cmdLineInfo->compilerOutputFile, L"/Fo:");
-		lstrcatW(cmdLineInfo->compilerOutputFile, tempFileName);
-		lstrcatW(cmdLineInfo->compilerOutputFile, L".compiled.obj");
-
-		cmdLineInfo->temporaryCompiledObjectFile = cmdLineInfo->compilerOutputFile + ARRAYSIZE(L"/Fo:") - 1;
+		lstrcatW(cmdLineInfo->compilerOutputFile, cmdLineInfo->objectFile);
 
 		// Sort and hash compiler command line
 		LPWSTR* sortedArgv = _malloca(cmdLineInfo->numCompilerFlags * sizeof(LPWSTR));
@@ -310,7 +310,10 @@ BOOL parse_cl_command_line(int argc, LPWSTR* argv, struct CommandLineInfo* cmdLi
 		_freea(tempCmdLine);
 		_freea(sortedArgv);
 
-		for(int i = 2; i < cmdLineInfo->numPreprocessorFlags - 2; ++i) // Adding all preprocessor flags except /P and the ones for input and output files to the compiler command line
+		if(noLogo)
+			add_compiler_flag(cmdLineInfo, L"/nologo");
+
+		for(int i = endAdditionalPreprocessorArgs; i < cmdLineInfo->numPreprocessorFlags - 2; ++i) // Adding all preprocessor flags except /P and the ones for input and output files to the compiler command line
 			add_compiler_flag(cmdLineInfo, cmdLineInfo->preprocessorFlags[i]);
 
 		add_compiler_flag(cmdLineInfo, cmdLineInfo->compilerOutputFile);
@@ -320,11 +323,7 @@ BOOL parse_cl_command_line(int argc, LPWSTR* argv, struct CommandLineInfo* cmdLi
 				cmdLineInfo->pdbFile = L"vc140.pdb"; // Strange visual studio default behavior...
 
 			lstrcpyW(cmdLineInfo->debugInformationOutputFile, L"/Fd:");
-			lstrcatW(cmdLineInfo->debugInformationOutputFile, tempFileName);
-			lstrcatW(cmdLineInfo->debugInformationOutputFile, L".debugsymbols.pdb");
-
-			cmdLineInfo->temporaryDebugInformationDatabase = cmdLineInfo->debugInformationOutputFile + ARRAYSIZE(L"/Fd:") - 1;
-
+			lstrcatW(cmdLineInfo->debugInformationOutputFile, cmdLineInfo->pdbFile);
 			add_compiler_flag(cmdLineInfo, cmdLineInfo->debugInformationOutputFile);
 		} else {
 			cmdLineInfo->pdbFile = NULL; // Resetting this in case /Fd was used without /Zi
@@ -338,8 +337,16 @@ BOOL parse_cl_command_line(int argc, LPWSTR* argv, struct CommandLineInfo* cmdLi
 	return FALSE;
 }
 
-BOOL launch_process(LPCWSTR executable, LPWSTR cmdLine, LPPROCESS_INFORMATION outProcessInfo) {
-	STARTUPINFOW startupInfo = {.cb = sizeof(startupInfo)};
+BOOL launch_process(LPCWSTR executable, LPWSTR cmdLine, LPPROCESS_INFORMATION outProcessInfo, BOOL silent) {
+	STARTUPINFOW startupInfo = {0};
+
+	startupInfo.cb = sizeof(startupInfo);
+
+	if(silent) {
+		startupInfo.dwFlags = STARTF_USESTDHANDLES;
+		startupInfo.hStdOutput = CreateFileW(L"nul:", GENERIC_WRITE, FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	}
+
 	BOOL result = CreateProcessW(executable, cmdLine, NULL, NULL, FALSE, 0, 0, NULL, &startupInfo, outProcessInfo);
 
 	if(!result)
@@ -552,7 +559,7 @@ int lelcache_main(int argc, LPWSTR* argv) {
 
 		make_cmd_line((int)cmdLineInfo.numPreprocessorFlags, cmdLineInfo.preprocessorFlags, cmdLineBuffer);
 
-		if(launch_process(argv[1], cmdLineBuffer, &processInfo) && wait_for_process(&processInfo) == 0) {
+		if(launch_process(argv[1], cmdLineBuffer, &processInfo, TRUE) && wait_for_process(&processInfo) == 0) {
 			HANDLE cacheInfoMutex = CreateMutexW(NULL, FALSE, L"lelcacheinfofile");
 			assert(cacheInfoMutex); // Does this ever fail?
 			struct CacheInfo cacheInfo;
@@ -580,35 +587,32 @@ int lelcache_main(int argc, LPWSTR* argv) {
 				CopyFileW(hashPath, cmdLineInfo.objectFile, FALSE);
 
 				if(cmdLineInfo.pdbFile) {
-					lstrcatW(hashPathEnd, L"\\pdb");
+					lstrcpyW(hashPathEnd, L"\\pdb");
 
-					if(file_exists(hashPath)) {
+					if(file_exists(hashPath))
 						CopyFileW(hashPath, cmdLineInfo.pdbFile, FALSE);
-					} else {
-						wprintf(L"Cached pdb file not found for '%s'\n", cmdLineInfo.sourceFile); // This should never happen unless somebody deletes it on purpose
-					}
+					else
+						wprintf(L"Cached pdb file not found for '%s', at '%s'\n", cmdLineInfo.sourceFile, hashPath); // This should never happen unless somebody deletes it on purpose
 				}
 			} else {
 				make_cmd_line((int)cmdLineInfo.numCompilerFlags, cmdLineInfo.compilerFlags, cmdLineBuffer);
 
 				*hashPathEnd = L'\0'; // Stripping '\obj' since it is a file and not part of the path
 
-				if(make_path(hashPath) && launch_process(argv[1], cmdLineBuffer, &processInfo)) {
+				if(make_path(hashPath) && launch_process(argv[1], cmdLineBuffer, &processInfo, FALSE)) {
 					exitCode = wait_for_process(&processInfo);
 
 					if(exitCode == 0) {
 						UINT64 additionalHashSize = 0;
 
 						lstrcpyW(hashPathEnd, L"\\obj");
-						CopyFileW(cmdLineInfo.temporaryCompiledObjectFile, hashPath, FALSE);
-						MoveFileW(cmdLineInfo.temporaryCompiledObjectFile, cmdLineInfo.objectFile);
+						CopyFileW(cmdLineInfo.objectFile, hashPath, FALSE);
 
 						additionalHashSize += file_size(hashPath);
 
 						if(cmdLineInfo.pdbFile) {
 							lstrcpyW(hashPathEnd, L"\\pdb");
-							CopyFileW(cmdLineInfo.temporaryDebugInformationDatabase, hashPath, FALSE);
-							MoveFileW(cmdLineInfo.temporaryDebugInformationDatabase, cmdLineInfo.pdbFile);
+							CopyFileW(cmdLineInfo.pdbFile, hashPath, FALSE);
 
 							additionalHashSize += file_size(hashPath);
 						}
@@ -619,10 +623,6 @@ int lelcache_main(int argc, LPWSTR* argv) {
 						cacheInfo.currentCacheSize += additionalHashSize;
 						cache_info(&cacheInfo, TRUE);
 						ReleaseMutex(cacheInfoMutex);
-						DeleteFileW(cmdLineInfo.temporaryCompiledObjectFile);
-
-						if(cmdLineInfo.pdbFile)
-							DeleteFileW(cmdLineInfo.temporaryDebugInformationDatabase);
 					}
 				}
 			}
@@ -644,7 +644,7 @@ int lelcache_main(int argc, LPWSTR* argv) {
 
 		make_cmd_line(argc - 1, argv + 1, cmdLine);
 
-		exitCode = launch_process(argv[1], cmdLine, &processInfo) ? wait_for_process(&processInfo) : EXIT_FAILURE;
+		exitCode = launch_process(argv[1], cmdLine, &processInfo, FALSE) ? wait_for_process(&processInfo) : EXIT_FAILURE;
 
 		_freea(cmdLine);
 	}
