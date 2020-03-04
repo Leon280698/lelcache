@@ -16,6 +16,8 @@
 #include "./xxhash/xxhash.h"
 #pragma warning(pop)
 
+#define DEFAULT_CACHE_SIZE_GIGABYTES 4
+
 #define LEL_HASH64_STRING_LENGTH (sizeof(XXH64_hash_t) * 2) // Two characters per byte
 
 typedef WCHAR Hash64String[LEL_HASH64_STRING_LENGTH + 1];
@@ -237,7 +239,7 @@ BOOL parse_cl_command_line(int argc, LPWSTR* argv, struct CommandLineInfo* cmdLi
 
 			// /nologo is a commonly used flag whose presence has no effect on the outcome of the compilation.
 			// That's why we check whether it exists and add it to the command line later after it was hashed.
-			if(lstrcmpW(flag, L"nologo")) {
+			if(lstrcmpW(flag, L"nologo") == 0) {
 				noLogo = TRUE;
 
 				continue;
@@ -422,22 +424,76 @@ BOOL make_path(LPCWSTR path) {
 	return TRUE;
 }
 
+struct CacheConfig {
+	UINT64 maxCacheSize;
+	WCHAR cachePath[MAX_PATH];
+} globalConfig = {0};
+
+BOOL cache_config(struct CacheConfig* config, BOOL write) {
+	PWSTR appDataLocal;
+	WCHAR cacheConfigPath[MAX_PATH];
+
+	SHGetKnownFolderPath(&FOLDERID_LocalAppData, 0, NULL, &appDataLocal);
+	lstrcpyW(cacheConfigPath, appDataLocal);
+	CoTaskMemFree(appDataLocal);
+	lstrcatW(cacheConfigPath, L"\\lelcache");
+	make_path(cacheConfigPath);
+	lstrcatW(cacheConfigPath, L"\\cache.config");
+
+	if(write) {
+		HANDLE file = CreateFileW(cacheConfigPath, GENERIC_WRITE, 0, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+
+		if(file == INVALID_HANDLE_VALUE) {
+			wprintf(L"Unable to open config file at '%s' for writing\n", cacheConfigPath);
+
+			return FALSE;
+		}
+
+		DWORD numBytesWritten;
+
+		WriteFile(file, config, sizeof(*config), &numBytesWritten, NULL);
+		CloseHandle(file);
+	} else {
+		if(file_exists(cacheConfigPath)) { // If file exists read it, otherwise initialize info with default values
+			HANDLE file = CreateFileW(cacheConfigPath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+
+			if(file == INVALID_HANDLE_VALUE) {
+				wprintf(L"Unable to open config file at '%s' for reading\n", cacheConfigPath);
+
+				return FALSE;
+			}
+
+			DWORD numBytesRead;
+			BOOL success = ReadFile(file, config, sizeof(*config), &numBytesRead, NULL);
+
+			CloseHandle(file);
+
+			return success;
+		} else {
+			PWSTR cachePath;
+
+			*config = (struct CacheConfig){0};
+			config->maxCacheSize = DEFAULT_CACHE_SIZE_GIGABYTES * 1024ll * 1024ll * 1024ll;
+			SHGetKnownFolderPath(&FOLDERID_Profile, 0, NULL, &cachePath); // Default cache path is in the user directory
+			lstrcpyW(config->cachePath, cachePath);
+			CoTaskMemFree(cachePath);
+		}
+	}
+
+	return TRUE;
+}
+
 struct CacheInfo {
 	UINT32 numCacheHits;
 	UINT32 numCacheMisses; // Does not include cases when the command line was not understood and the compiler was called directly. TODO: should it?
-	UINT64 maxCacheSize;
 	UINT64 currentCacheSize;
-	WCHAR cachePath[MAX_PATH];
 };
 
 BOOL cache_info(struct CacheInfo* info, BOOL write) {
-	PWSTR appDataLocal;
 	WCHAR cacheInfoPath[MAX_PATH];
 
-	SHGetKnownFolderPath(&FOLDERID_LocalAppData, 0, NULL, &appDataLocal);
-	lstrcpyW(cacheInfoPath, appDataLocal);
-	CoTaskMemFree(appDataLocal);
-	lstrcatW(cacheInfoPath, L"\\lelcache");
+	lstrcpyW(cacheInfoPath, globalConfig.cachePath);
+	lstrcatW(cacheInfoPath, L"\\.lelcache");
 	make_path(cacheInfoPath);
 	lstrcatW(cacheInfoPath, L"\\cache.info");
 
@@ -471,13 +527,7 @@ BOOL cache_info(struct CacheInfo* info, BOOL write) {
 
 			return success;
 		} else {
-			PWSTR cachePath;
-
-			*info = (struct CacheInfo){ 0 };
-			info->maxCacheSize = 4ll * 1024ll * 1024ll * 1024ll; // Default cache size is 4 gigabytes
-			SHGetKnownFolderPath(&FOLDERID_Profile, 0, NULL, &cachePath); // Default cache path is in the user directory
-			lstrcpyW(info->cachePath, cachePath);
-			CoTaskMemFree(cachePath);
+			*info = (struct CacheInfo){0};
 		}
 	}
 
@@ -510,9 +560,7 @@ int lelcache_main(int argc, LPWSTR* argv) {
 			XXH64_hash_t hash = hash_file_content(cmdLineInfo.temporaryPreprocessedFile);
 			Hash64String hashStr;
 
-			WaitForSingleObject(cacheInfoMutex, INFINITE);
-			cache_info(&cacheInfo, FALSE);
-			lstrcpyW(hashPath, cacheInfo.cachePath);
+			lstrcpyW(hashPath, globalConfig.cachePath);
 			lstrcatW(hashPath, L"\\.lelcache\\");
 			hash64_to_string(hash, hashStr);
 			path_from_hash64_string(hashStr, hashPath + lstrlenW(hashPath));
@@ -524,8 +572,9 @@ int lelcache_main(int argc, LPWSTR* argv) {
 			lstrcpyW(hashPathEnd, L"\\obj");
 
 			if(file_exists(hashPath)) {
+				WaitForSingleObject(cacheInfoMutex, INFINITE);
+				cache_info(&cacheInfo, FALSE);
 				++cacheInfo.numCacheHits;
-
 				cache_info(&cacheInfo, TRUE);
 				ReleaseMutex(cacheInfoMutex);
 				CopyFileW(hashPath, cmdLineInfo.objectFile, FALSE);
@@ -540,7 +589,6 @@ int lelcache_main(int argc, LPWSTR* argv) {
 					}
 				}
 			} else {
-				ReleaseMutex(cacheInfoMutex);
 				make_cmd_line((int)cmdLineInfo.numCompilerFlags, cmdLineInfo.compilerFlags, cmdLineBuffer);
 
 				*hashPathEnd = L'\0'; // Stripping '\obj' since it is a file and not part of the path
@@ -626,6 +674,9 @@ int wmain(int argc, LPWSTR* argv, LPWSTR* envp) {
 		return EXIT_FAILURE;
 	}
 
+	if (!cache_config(&globalConfig, FALSE))
+		return EXIT_FAILURE;
+
 	if(*argv[1] == L'-') {
 		for(int i = 1; i < argc; ++i) {
 			if(*argv[i] != L'-') {
@@ -646,37 +697,37 @@ int wmain(int argc, LPWSTR* argv, LPWSTR* envp) {
 					wprintf(L"cache hits:         %lu\n"
 							L"cache misses:       %lu\n"
 							L"cache hit rate:     %.2f%%\n"
-							L"maximum cache size: %llu MB\n"
 							L"current cache size: %llu MB\n"
+							L"maximum cache size: %llu MB\n"
 							L"cache location:     %s\n",
 							info.numCacheHits,
 							info.numCacheMisses,
 							(float)info.numCacheHits / (info.numCacheHits + info.numCacheMisses) * 100.0f,
-							info.maxCacheSize / (1024ll * 1024ll),
 							info.currentCacheSize / (1024ll * 1024ll),
-							info.cachePath);
+							globalConfig.maxCacheSize / (1024ll * 1024ll),
+							globalConfig.cachePath);
 				}
 
 				break;
 			case 'm':
-				++arg;
+				{
+					++arg;
 
-				if(*arg == L'\0') {
-					if(i != argc - 1) {
-						arg = argv[++i];
-					} else {
-						wprintf(L"The -m option expects a numer in megabytes\n");
+					if(*arg == L'\0') {
+						if(i != argc - 1) {
+							arg = argv[++i];
+						} else {
+							wprintf(L"The -m option expects a numer in megabytes\n");
 
-						return EXIT_FAILURE;
+							return EXIT_FAILURE;
+						}
 					}
-				}
-
-				if(cache_info(&info, FALSE)) {
+				
 					UINT64 newCacheSize = (UINT64)wcstoull(arg, NULL, 0);
 
 					if(newCacheSize >= 32) {
-						info.maxCacheSize = newCacheSize * 1024ll * 1024ll; // TODO: Clean up the cache if necessary
-						cache_info(&info, TRUE);
+						globalConfig.maxCacheSize = newCacheSize * 1024ll * 1024ll; // TODO: Clean up the cache if necessary
+						cache_config(&globalConfig, TRUE);
 					} else {
 						wprintf(L"Cache size must be at least 32 megabytes\n");
 
@@ -686,19 +737,19 @@ int wmain(int argc, LPWSTR* argv, LPWSTR* envp) {
 
 				break;
 			case 'p':
-				++arg;
+				{
+					++arg;
 
-				if(*arg == L'\0') {
-					if(i != argc - 1) {
-						arg = argv[++i];
-					} else {
-						wprintf(L"The -p option expects a path as an argument\n");
+					if(*arg == L'\0') {
+						if(i != argc - 1) {
+							arg = argv[++i];
+						} else {
+							wprintf(L"The -p option expects a path as an argument\n");
 
-						return EXIT_FAILURE;
+							return EXIT_FAILURE;
+						}
 					}
-				}
 
-				if(cache_info(&info, FALSE)) {
 					WCHAR buffer[MAX_PATH];
 
 					while(iswspace(*arg))
@@ -713,8 +764,8 @@ int wmain(int argc, LPWSTR* argv, LPWSTR* envp) {
 						*arg = L'\0';
 					}
 
-					lstrcpyW(info.cachePath, buffer);
-					cache_info(&info, TRUE); // TODO: Uncomment and move the cache files from the old location to the new one
+					lstrcpyW(globalConfig.cachePath, buffer);
+					cache_config(&globalConfig, TRUE);
 				}
 
 				break;
