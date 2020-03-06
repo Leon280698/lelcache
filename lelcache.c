@@ -219,7 +219,9 @@ BOOL parse_cl_command_line(int argc, LPWSTR* argv, struct CommandLineInfo* cmdLi
 				case L'o':
 					outputFileStr = &cmdLineInfo->objectFile;
 					break;
-				case L'S': // The /FS flag is ignored as pdb files are generated individually for each object file
+				// The /FS and /Fd flags are ignored as pdb files are generated individually for each object file
+				case L'd':
+				case L'S':
 					continue;
 				}
 
